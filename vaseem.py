@@ -1,35 +1,47 @@
-import os
+import streamlit as st
 import pickle
 import re
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import os
+import numpy as np
 
-app = Flask(__name__)
-CORS(app)  # Allow React frontend to call this API
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="AI Fraud Shield Pro", page_icon="🛡️", layout="wide")
 
-# ------------------------------------------------------------
-# Load trained models (if files exist)
-# ------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# --- CUSTOM CSS ---
+st.markdown("""
+    <style>
+    .main { background-color: #f5f7f9; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .safe-box { border: 2px solid #28a745; padding: 15px; border-radius: 10px; background-color: #f0fff4; }
+    .suspicious-box { border: 2px solid #ffc107; padding: 15px; border-radius: 10px; background-color: #fff9e6; }
+    .highrisk-box { border: 2px solid #dc3545; padding: 15px; border-radius: 10px; background-color: #fff5f5; }
+    </style>
+    """, unsafe_allow_html=True)
 
-def load_pickle(filename):
-    path = os.path.join(BASE_DIR, filename)
-    if os.path.exists(path):
-        with open(path, 'rb') as f:
-            return pickle.load(f)
-    return None
+# --- LOAD MODELS ---
+@st.cache_resource
+def load_models():
+    models = {}
+    try:
+        models['model_risk'] = pickle.load(open('model_risk.pkl', 'rb'))
+        models['tfidf'] = pickle.load(open('tfidf_vectorizer.pkl', 'rb'))
+        models['label_encoder'] = pickle.load(open('label_encoder.pkl', 'rb'))
+    except FileNotFoundError as e:
+        st.error(f"Missing model file: {e}. Please ensure model_risk.pkl, tfidf_vectorizer.pkl, and label_encoder.pkl are in the app directory.")
+        return None
 
-model_risk = load_pickle('model_risk.pkl')
-model_type = load_pickle('model_type.pkl')
-tfidf = load_pickle('tfidf_vectorizer.pkl')
-le = load_pickle('label_encoder.pkl')
+    # Try to load multi-class model, but it's optional (fallback used if missing)
+    try:
+        models['model_type'] = pickle.load(open('model_type.pkl', 'rb'))
+        models['type_model_available'] = True
+    except FileNotFoundError:
+        models['type_model_available'] = False
+        st.warning("Fraud type model not found. Using rule‑based fallback for fraud type detection.")
+    return models
 
-if model_risk is None or tfidf is None or le is None:
-    print("WARNING: Some essential model files are missing. Please check.")
+models = load_models()
 
-# ------------------------------------------------------------
-# Text preprocessing (must match training)
-# ------------------------------------------------------------
+# --- TEXT CLEANING (must match training) ---
 def clean_text(text):
     text = str(text).lower()
     text = re.sub(r'http\S+|www\S+|https\S+', ' URL ', text)
@@ -39,43 +51,7 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-# ------------------------------------------------------------
-# Map detailed fraud type to one of the five required categories
-# ------------------------------------------------------------
-def map_to_five_categories(detailed_type):
-    dt = detailed_type.lower()
-    if any(k in dt for k in ['upi', 'bank', 'payment', 'atm', 'debit', 'credit', 'account']):
-        return 'UPI Fraud'
-    elif any(k in dt for k in ['job', 'work', 'employ', 'career', 'salary', 'income']):
-        return 'Job Scam'
-    elif any(k in dt for k in ['lottery', 'prize', 'won', 'winner', 'kbc', 'draw', 'lucky']):
-        return 'Lottery Scam'
-    elif any(k in dt for k in ['phish', 'kyc', 'verify', 'update', 'aadhaar', 'pan', 'link',
-                                'courier', 'parcel', 'dhl', 'fedex', 'netflix', 'prime',
-                                'subscription', 'ott', 'education', 'govt', 'matrimony']):
-        return 'Phishing'
-    else:
-        return 'Others'
-
-# ------------------------------------------------------------
-# Fallback rule‑based classifier (used if model_type is missing)
-# ------------------------------------------------------------
-def rule_based_fraud_type(message):
-    msg = message.lower()
-    if any(k in msg for k in ['upi', 'gpay', 'phonepe', 'pin', 'otp', 'bank', 'account', 'atm']):
-        return 'UPI Fraud'
-    elif any(k in msg for k in ['job', 'work from home', 'salary', 'part time', 'earning']):
-        return 'Job Scam'
-    elif any(k in msg for k in ['lottery', 'won', 'prize', 'kbc', 'winner']):
-        return 'Lottery Scam'
-    elif any(k in msg for k in ['kyc', 'update', 'verify', 'aadhaar', 'pan', 'link', 'click']):
-        return 'Phishing'
-    else:
-        return 'Others'
-
-# ------------------------------------------------------------
-# Keyword highlighting (returns HTML)
-# ------------------------------------------------------------
+# --- KEYWORD HIGHLIGHTING ---
 def highlight_keywords(text):
     keywords = {
         'upi': 'red', 'gpay': 'red', 'phonepe': 'red', 'pin': 'red', 'otp': 'red',
@@ -94,10 +70,22 @@ def highlight_keywords(text):
         highlighted = pattern.sub(f'<span style="color:{color};font-weight:bold;">\\1</span>', highlighted)
     return highlighted
 
-# ------------------------------------------------------------
-# Preventive tips based on the broad category
-# ------------------------------------------------------------
-def get_preventive_tips(category):
+# --- FALLBACK RULE‑BASED FRAUD TYPE CLASSIFIER ---
+def rule_based_fraud_type(message):
+    msg = message.lower()
+    if any(k in msg for k in ['upi', 'gpay', 'phonepe', 'pin', 'otp', 'bank', 'account', 'atm']):
+        return 'UPI Fraud'
+    elif any(k in msg for k in ['job', 'work from home', 'salary', 'part time', 'earning']):
+        return 'Job Scam'
+    elif any(k in msg for k in ['lottery', 'won', 'prize', 'kbc', 'winner']):
+        return 'Lottery Scam'
+    elif any(k in msg for k in ['kyc', 'update', 'verify', 'aadhaar', 'pan', 'link', 'click']):
+        return 'Phishing'
+    else:
+        return 'Others'
+
+# --- PREVENTIVE TIPS ---
+def get_preventive_tips(fraud_type):
     tips = {
         "UPI Fraud": [
             "❌ NEVER share UPI PIN or OTP with anyone",
@@ -130,70 +118,97 @@ def get_preventive_tips(category):
             "📞 Report suspicious messages to 1930"
         ]
     }
-    return tips.get(category, tips["Others"])
+    return tips.get(fraud_type, tips["Others"])
 
-# ------------------------------------------------------------
-# API endpoint
-# ------------------------------------------------------------
-@app.route('/predict', methods=['POST'])
-def predict():
-    data = request.get_json()
-    if not data or 'message' not in data:
-        return jsonify({'error': 'No message provided'}), 400
+# --- MAIN UI ---
+st.title("🛡️ AI Fraud Shield Pro")
+st.markdown("### Real-time SMS/Message Fraud Risk Analysis")
 
-    message = data['message']
+user_input = st.text_area("📨 Paste the message you received:", height=150)
 
-    # Clean and vectorize
-    cleaned = clean_text(message)
-    vec = tfidf.transform([cleaned])
-
-    # Scam probability (binary classifier)
-    prob_spam = model_risk.predict_proba(vec)[0][1] * 100
-
-    # Risk classification
-    if prob_spam < 30:
-        risk = "Safe"
-    elif prob_spam < 75:
-        risk = "Suspicious"
+if st.button("🔍 Analyze Message", type="primary", use_container_width=True):
+    if not user_input or len(user_input.strip()) < 10:
+        st.warning("⚠️ Please enter a valid message (at least 10 characters)")
+    elif models is None:
+        st.error("Models not loaded. Please check model files.")
     else:
-        risk = "High Risk"
+        with st.spinner("Analyzing..."):
+            # Clean and vectorize
+            cleaned = clean_text(user_input)
+            vec = models['tfidf'].transform([cleaned])
 
-    # Fraud type detection
-    if risk == "Safe":
-        detailed_type = "None"
-        broad_category = "None"
-    else:
-        if model_type is not None:
-            # Use trained multi-class model
-            type_encoded = model_type.predict(vec)[0]
-            detailed_type = le.inverse_transform([type_encoded])[0]
-            broad_category = map_to_five_categories(detailed_type)
-        else:
-            # Fallback rule-based
-            broad_category = rule_based_fraud_type(message)
-            detailed_type = broad_category  # or could be more detailed
+            # Scam probability (binary classifier)
+            prob_spam = models['model_risk'].predict_proba(vec)[0][1] * 100
 
-    # Highlighted text
-    highlighted = highlight_keywords(message)
+            # Risk classification
+            if prob_spam < 30:
+                risk = "Safe"
+            elif prob_spam < 75:
+                risk = "Suspicious"
+            else:
+                risk = "High Risk"
 
-    # Preventive tips
-    tips = get_preventive_tips(broad_category if risk != "Safe" else "Others")
+            # Fraud type detection
+            if risk == "Safe":
+                fraud_type = "None"
+            else:
+                if models.get('type_model_available'):
+                    # Use trained multi-class model
+                    type_encoded = models['model_type'].predict(vec)[0]
+                    detailed_type = models['label_encoder'].inverse_transform([type_encoded])[0]
+                    # Map detailed type to one of the five categories if needed
+                    # (Assuming the model already outputs one of the five; if not, add mapping)
+                    fraud_type = detailed_type  # adjust if necessary
+                else:
+                    # Fallback rule-based
+                    fraud_type = rule_based_fraud_type(user_input)
 
-    response = {
-        'scam_probability': round(prob_spam, 2),
-        'risk_classification': risk,
-        'fraud_type': broad_category,          # one of the five categories
-        'detailed_fraud_type': detailed_type,  # original model output (if available)
-        'highlighted_text': highlighted,
-        'preventive_tips': tips,
-        'helpline': '1930',
-        'cybercrime_website': 'https://www.cybercrime.gov.in'
-    }
-    return jsonify(response)
+            # Keyword highlighting
+            highlighted = highlight_keywords(user_input)
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'})
+            # Preventive tips
+            tips = get_preventive_tips(fraud_type if risk != "Safe" else "Others")
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+            # Display results
+            st.divider()
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Scam Probability", f"{prob_spam:.1f}%")
+            col2.metric("Risk Level", risk)
+            col3.metric("Fraud Type", fraud_type)
+
+            st.progress(int(prob_spam))
+
+            if risk == "Safe":
+                st.markdown(f"""
+                <div class="safe-box">
+                    <h4 style='color:#28a745;'>✅ Safe Message</h4>
+                    <p>This message appears legitimate. However, always stay vigilant!</p>
+                </div>
+                """, unsafe_allow_html=True)
+            elif risk == "Suspicious":
+                st.markdown(f"""
+                <div class="suspicious-box">
+                    <h4 style='color:#856404;'>⚠️ Suspicious Message</h4>
+                    <p>This message shows suspicious patterns. Do not engage with the sender.</p>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="highrisk-box">
+                    <h4 style='color:#dc3545;'>🚨 HIGH RISK - SCAM DETECTED</h4>
+                    <p>This is likely a <b>{fraud_type}</b>. DO NOT respond or click any links.</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.subheader("🔍 Pattern Analysis")
+            st.markdown(f"**Highlighted Text:** {highlighted}", unsafe_allow_html=True)
+
+            st.subheader("💡 Preventive Guidance")
+            for tip in tips:
+                st.write(tip)
+
+            st.info("📞 Official Helpline: **1930** | [Report Online](https://www.cybercrime.gov.in)")
+
+# --- FOOTER ---
+st.divider()
+st.caption("🛡️ AI Fraud Shield Pro | Powered by Machine Learning | Report Suspicious Messages to 1930")
